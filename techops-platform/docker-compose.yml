@@ -1,0 +1,526 @@
+---
+# =============================================================================
+# TechOps Platform — MVP Docker Compose Stack
+# Version: 1.0.0
+# Services: Forgejo · Vikunja · BookStack · n8n · Grafana · Loki ·
+#           Prometheus · Meilisearch · Traefik · PostgreSQL · Redis
+# Usage: cp .env.example .env && docker compose up -d
+# =============================================================================
+
+name: techops-platform
+
+networks:
+  frontend:
+    name: techops_frontend
+  backend:
+    name: techops_backend
+  monitoring:
+    name: techops_monitoring
+
+volumes:
+  postgres_data:
+  redis_data:
+  forgejo_data:
+  vikunja_data:
+  bookstack_data:
+  bookstack_uploads:
+  n8n_data:
+  grafana_data:
+  loki_data:
+  prometheus_data:
+  meilisearch_data:
+  traefik_certs:
+
+services:
+
+  # ============================================================
+  # TRAEFIK — Reverse Proxy & SSL Termination
+  # ============================================================
+  traefik:
+    image: traefik:v3.1
+    container_name: techops_traefik
+    restart: unless-stopped
+    command:
+      - "--api.dashboard=true"
+      - "--providers.docker=true"
+      - "--providers.docker.exposedbydefault=false"
+      - "--entrypoints.web.address=:80"
+      - "--entrypoints.websecure.address=:443"
+      - "--entrypoints.web.http.redirections.entrypoint.to=websecure"
+      - "--entrypoints.web.http.redirections.entrypoint.scheme=https"
+      - "--certificatesresolvers.letsencrypt.acme.tlschallenge=true"
+      - "--certificatesresolvers.letsencrypt.acme.email=${ACME_EMAIL}"
+      - "--certificatesresolvers.letsencrypt.acme.storage=/certs/acme.json"
+      - "--log.level=INFO"
+      - "--accesslog=true"
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - traefik_certs:/certs
+    networks:
+      - frontend
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.dashboard.rule=Host(`traefik.${BASE_DOMAIN}`)"
+      - "traefik.http.routers.dashboard.entrypoints=websecure"
+      - "traefik.http.routers.dashboard.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.dashboard.service=api@internal"
+      - "traefik.http.routers.dashboard.middlewares=auth"
+      - "traefik.http.middlewares.auth.basicauth.users=${TRAEFIK_DASHBOARD_AUTH}"
+    healthcheck:
+      test: ["CMD", "traefik", "healthcheck"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # ============================================================
+  # POSTGRESQL — Shared Database
+  # ============================================================
+  postgres:
+    image: postgres:16-alpine
+    container_name: techops_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: techops
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=en_US.UTF-8"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/init-dbs.sh:/docker-entrypoint-initdb.d/init-dbs.sh:ro
+    networks:
+      - backend
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d techops"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  # ============================================================
+  # REDIS — Cache & Queue
+  # ============================================================
+  redis:
+    image: redis:7-alpine
+    container_name: techops_redis
+    restart: unless-stopped
+    command: >
+      redis-server
+      --requirepass ${REDIS_PASSWORD}
+      --maxmemory 256mb
+      --maxmemory-policy allkeys-lru
+      --save 900 1
+      --save 300 10
+    volumes:
+      - redis_data:/data
+    networks:
+      - backend
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # ============================================================
+  # FORGEJO — Git Repository Hosting
+  # ============================================================
+  forgejo:
+    image: codeberg.org/forgejo/forgejo:8
+    container_name: techops_forgejo
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      USER_UID: 1000
+      USER_GID: 1000
+      FORGEJO__database__DB_TYPE: postgres
+      FORGEJO__database__HOST: postgres:5432
+      FORGEJO__database__NAME: forgejo
+      FORGEJO__database__USER: ${POSTGRES_USER}
+      FORGEJO__database__PASSWD: ${POSTGRES_PASSWORD}
+      FORGEJO__cache__ADAPTER: redis
+      FORGEJO__cache__HOST: "redis://:${REDIS_PASSWORD}@redis:6379/0?pool_size=100&idle_timeout=180s"
+      FORGEJO__session__PROVIDER: redis
+      FORGEJO__session__PROVIDER_CONFIG: "redis://:${REDIS_PASSWORD}@redis:6379/1?pool_size=100&idle_timeout=180s"
+      FORGEJO__server__DOMAIN: git.${BASE_DOMAIN}
+      FORGEJO__server__ROOT_URL: https://git.${BASE_DOMAIN}/
+      FORGEJO__server__SSH_DOMAIN: git.${BASE_DOMAIN}
+      FORGEJO__server__SSH_PORT: 2222
+      FORGEJO__server__HTTP_PORT: 3000
+      FORGEJO__server__DISABLE_SSH: "false"
+      FORGEJO__service__DISABLE_REGISTRATION: ${FORGEJO_DISABLE_REGISTRATION:-true}
+      FORGEJO__service__REQUIRE_SIGNIN_VIEW: ${FORGEJO_REQUIRE_SIGNIN:-true}
+      FORGEJO__mailer__ENABLED: ${SMTP_ENABLED:-false}
+      FORGEJO__mailer__SMTP_ADDR: ${SMTP_HOST}
+      FORGEJO__mailer__SMTP_PORT: ${SMTP_PORT}
+      FORGEJO__mailer__USER: ${SMTP_USER}
+      FORGEJO__mailer__PASSWD: ${SMTP_PASSWORD}
+      FORGEJO__mailer__FROM: ${SMTP_FROM}
+      FORGEJO__log__LEVEL: Info
+    volumes:
+      - forgejo_data:/data
+    ports:
+      - "2222:22"
+    networks:
+      - frontend
+      - backend
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.forgejo.rule=Host(`git.${BASE_DOMAIN}`)"
+      - "traefik.http.routers.forgejo.entrypoints=websecure"
+      - "traefik.http.routers.forgejo.tls.certresolver=letsencrypt"
+      - "traefik.http.services.forgejo.loadbalancer.server.port=3000"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  # ============================================================
+  # VIKUNJA — Task Management
+  # ============================================================
+  vikunja:
+    image: vikunja/vikunja:0.24
+    container_name: techops_vikunja
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      VIKUNJA_SERVICE_PUBLICURL: https://tasks.${BASE_DOMAIN}/
+      VIKUNJA_DATABASE_TYPE: postgres
+      VIKUNJA_DATABASE_HOST: postgres
+      VIKUNJA_DATABASE_DATABASE: vikunja
+      VIKUNJA_DATABASE_USER: ${POSTGRES_USER}
+      VIKUNJA_DATABASE_PASSWORD: ${POSTGRES_PASSWORD}
+      VIKUNJA_DATABASE_SSLMODE: disable
+      VIKUNJA_REDIS_ENABLED: "true"
+      VIKUNJA_REDIS_HOST: redis:6379
+      VIKUNJA_REDIS_PASSWORD: ${REDIS_PASSWORD}
+      VIKUNJA_KEYVALUE_TYPE: redis
+      VIKUNJA_SERVICE_JWT_SECRET: ${VIKUNJA_JWT_SECRET}
+      VIKUNJA_SERVICE_ENABLEREGISTRATION: ${VIKUNJA_ENABLE_REGISTRATION:-false}
+      VIKUNJA_MAILER_ENABLED: ${SMTP_ENABLED:-false}
+      VIKUNJA_MAILER_HOST: ${SMTP_HOST}
+      VIKUNJA_MAILER_PORT: ${SMTP_PORT}
+      VIKUNJA_MAILER_USERNAME: ${SMTP_USER}
+      VIKUNJA_MAILER_PASSWORD: ${SMTP_PASSWORD}
+      VIKUNJA_MAILER_FROMEMAIL: ${SMTP_FROM}
+      VIKUNJA_LOG_LEVEL: INFO
+    volumes:
+      - vikunja_data:/app/vikunja/files
+    networks:
+      - frontend
+      - backend
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.vikunja.rule=Host(`tasks.${BASE_DOMAIN}`)"
+      - "traefik.http.routers.vikunja.entrypoints=websecure"
+      - "traefik.http.routers.vikunja.tls.certresolver=letsencrypt"
+      - "traefik.http.services.vikunja.loadbalancer.server.port=3456"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3456/api/v1/info"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  # ============================================================
+  # BOOKSTACK — Knowledge Management Wiki
+  # ============================================================
+  bookstack:
+    image: lscr.io/linuxserver/bookstack:24.10
+    container_name: techops_bookstack
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PUID: 1000
+      PGID: 1000
+      TZ: ${TIMEZONE:-Asia/Kolkata}
+      APP_URL: https://wiki.${BASE_DOMAIN}
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_DATABASE: bookstack
+      DB_USERNAME: ${POSTGRES_USER}
+      DB_PASSWORD: ${POSTGRES_PASSWORD}
+      CACHE_DRIVER: redis
+      SESSION_DRIVER: redis
+      REDIS_SERVERS: "redis:6379:1:${REDIS_PASSWORD}"
+      MAIL_DRIVER: ${SMTP_DRIVER:-log}
+      MAIL_HOST: ${SMTP_HOST}
+      MAIL_PORT: ${SMTP_PORT}
+      MAIL_USERNAME: ${SMTP_USER}
+      MAIL_PASSWORD: ${SMTP_PASSWORD}
+      MAIL_FROM: ${SMTP_FROM}
+      APP_KEY: ${BOOKSTACK_APP_KEY}
+      APP_LANG: en
+      ALLOW_CONTENT_SCRIPTS: "false"
+      WKHTMLTOPDF: /usr/bin/wkhtmltopdf
+    volumes:
+      - bookstack_data:/config
+      - bookstack_uploads:/config/www/uploads
+    networks:
+      - frontend
+      - backend
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.bookstack.rule=Host(`wiki.${BASE_DOMAIN}`)"
+      - "traefik.http.routers.bookstack.entrypoints=websecure"
+      - "traefik.http.routers.bookstack.tls.certresolver=letsencrypt"
+      - "traefik.http.services.bookstack.loadbalancer.server.port=80"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:80"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  # ============================================================
+  # N8N — Workflow Automation
+  # ============================================================
+  n8n:
+    image: n8nio/n8n:1.65
+    container_name: techops_n8n
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      N8N_HOST: automation.${BASE_DOMAIN}
+      N8N_PORT: 5678
+      N8N_PROTOCOL: https
+      WEBHOOK_URL: https://automation.${BASE_DOMAIN}/
+      N8N_BASIC_AUTH_ACTIVE: "true"
+      N8N_BASIC_AUTH_USER: ${N8N_BASIC_AUTH_USER}
+      N8N_BASIC_AUTH_PASSWORD: ${N8N_BASIC_AUTH_PASSWORD}
+      DB_TYPE: postgresdb
+      DB_POSTGRESDB_HOST: postgres
+      DB_POSTGRESDB_PORT: 5432
+      DB_POSTGRESDB_DATABASE: n8n
+      DB_POSTGRESDB_USER: ${POSTGRES_USER}
+      DB_POSTGRESDB_PASSWORD: ${POSTGRES_PASSWORD}
+      QUEUE_BULL_REDIS_HOST: redis
+      QUEUE_BULL_REDIS_PORT: 6379
+      QUEUE_BULL_REDIS_PASSWORD: ${REDIS_PASSWORD}
+      EXECUTIONS_MODE: queue
+      N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY}
+      N8N_LOG_LEVEL: info
+      N8N_LOG_OUTPUT: console
+      GENERIC_TIMEZONE: ${TIMEZONE:-Asia/Kolkata}
+      N8N_METRICS: "true"
+      N8N_PERSONALIZATION_ENABLED: "false"
+      N8N_DIAGNOSTICS_ENABLED: "false"
+    volumes:
+      - n8n_data:/home/node/.n8n
+      - ./automation/scripts:/scripts:ro
+    networks:
+      - frontend
+      - backend
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.n8n.rule=Host(`automation.${BASE_DOMAIN}`)"
+      - "traefik.http.routers.n8n.entrypoints=websecure"
+      - "traefik.http.routers.n8n.tls.certresolver=letsencrypt"
+      - "traefik.http.services.n8n.loadbalancer.server.port=5678"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5678/healthz"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  # ============================================================
+  # MEILISEARCH — Full-Text Search Engine
+  # ============================================================
+  meilisearch:
+    image: getmeili/meilisearch:v1.11
+    container_name: techops_meilisearch
+    restart: unless-stopped
+    environment:
+      MEILI_MASTER_KEY: ${MEILISEARCH_MASTER_KEY}
+      MEILI_ENV: production
+      MEILI_DB_PATH: /meili_data
+      MEILI_LOG_LEVEL: INFO
+      MEILI_MAX_INDEXING_MEMORY: "512Mb"
+    volumes:
+      - meilisearch_data:/meili_data
+    networks:
+      - frontend
+      - backend
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.meilisearch.rule=Host(`search.${BASE_DOMAIN}`)"
+      - "traefik.http.routers.meilisearch.entrypoints=websecure"
+      - "traefik.http.routers.meilisearch.tls.certresolver=letsencrypt"
+      - "traefik.http.services.meilisearch.loadbalancer.server.port=7700"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:7700/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ============================================================
+  # PROMETHEUS — Metrics Collection
+  # ============================================================
+  prometheus:
+    image: prom/prometheus:v2.55.0
+    container_name: techops_prometheus
+    restart: unless-stopped
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=30d"
+      - "--storage.tsdb.retention.size=5GB"
+      - "--web.console.libraries=/etc/prometheus/console_libraries"
+      - "--web.console.templates=/etc/prometheus/consoles"
+      - "--web.enable-lifecycle"
+      - "--web.enable-admin-api"
+    volumes:
+      - prometheus_data:/prometheus
+      - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./monitoring/prometheus/rules:/etc/prometheus/rules:ro
+    networks:
+      - monitoring
+      - backend
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.prometheus.rule=Host(`prometheus.${BASE_DOMAIN}`)"
+      - "traefik.http.routers.prometheus.entrypoints=websecure"
+      - "traefik.http.routers.prometheus.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.prometheus.middlewares=auth"
+      - "traefik.http.services.prometheus.loadbalancer.server.port=9090"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--tries=1", "http://localhost:9090/-/healthy", "-O", "/dev/null"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ============================================================
+  # LOKI — Log Aggregation
+  # ============================================================
+  loki:
+    image: grafana/loki:3.2.0
+    container_name: techops_loki
+    restart: unless-stopped
+    command: -config.file=/etc/loki/loki.yml
+    volumes:
+      - loki_data:/loki
+      - ./monitoring/loki/loki.yml:/etc/loki/loki.yml:ro
+    networks:
+      - monitoring
+      - backend
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--tries=1", "http://localhost:3100/ready", "-O", "/dev/null"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  # ============================================================
+  # PROMTAIL — Log Shipper to Loki
+  # ============================================================
+  promtail:
+    image: grafana/promtail:3.2.0
+    container_name: techops_promtail
+    restart: unless-stopped
+    command: -config.file=/etc/promtail/promtail.yml
+    volumes:
+      - /var/log:/var/log:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./monitoring/loki/promtail.yml:/etc/promtail/promtail.yml:ro
+    networks:
+      - monitoring
+    depends_on:
+      loki:
+        condition: service_healthy
+
+  # ============================================================
+  # GRAFANA — Analytics & Dashboards
+  # ============================================================
+  grafana:
+    image: grafana/grafana:11.3.0
+    container_name: techops_grafana
+    restart: unless-stopped
+    depends_on:
+      prometheus:
+        condition: service_healthy
+      loki:
+        condition: service_healthy
+    environment:
+      GF_SERVER_ROOT_URL: https://grafana.${BASE_DOMAIN}
+      GF_SERVER_DOMAIN: grafana.${BASE_DOMAIN}
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD}
+      GF_SECURITY_SECRET_KEY: ${GRAFANA_SECRET_KEY}
+      GF_DATABASE_TYPE: postgres
+      GF_DATABASE_HOST: postgres:5432
+      GF_DATABASE_NAME: grafana
+      GF_DATABASE_USER: ${POSTGRES_USER}
+      GF_DATABASE_PASSWORD: ${POSTGRES_PASSWORD}
+      GF_DATABASE_SSL_MODE: disable
+      GF_SESSION_PROVIDER: redis
+      GF_SESSION_PROVIDER_CONFIG: "addr=redis:6379,password=${REDIS_PASSWORD},db=3"
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_USERS_AUTO_ASSIGN_ORG: "true"
+      GF_USERS_AUTO_ASSIGN_ORG_ROLE: Viewer
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_SMTP_ENABLED: ${SMTP_ENABLED:-false}
+      GF_SMTP_HOST: "${SMTP_HOST}:${SMTP_PORT}"
+      GF_SMTP_USER: ${SMTP_USER}
+      GF_SMTP_PASSWORD: ${SMTP_PASSWORD}
+      GF_SMTP_FROM_ADDRESS: ${SMTP_FROM}
+      GF_INSTALL_PLUGINS: grafana-piechart-panel,grafana-clock-panel,grafana-worldmap-panel
+      GF_FEATURE_TOGGLES_ENABLE: "ngalert"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    networks:
+      - frontend
+      - monitoring
+      - backend
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.grafana.rule=Host(`grafana.${BASE_DOMAIN}`)"
+      - "traefik.http.routers.grafana.entrypoints=websecure"
+      - "traefik.http.routers.grafana.tls.certresolver=letsencrypt"
+      - "traefik.http.services.grafana.loadbalancer.server.port=3000"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  # ============================================================
+  # WATCHTOWER — Automatic Container Updates (optional)
+  # ============================================================
+  watchtower:
+    image: containrrr/watchtower:1.7.1
+    container_name: techops_watchtower
+    restart: unless-stopped
+    environment:
+      WATCHTOWER_CLEANUP: "true"
+      WATCHTOWER_INCLUDE_STOPPED: "false"
+      WATCHTOWER_SCHEDULE: "0 0 3 * * *"  # 3 AM daily
+      WATCHTOWER_NOTIFICATIONS: slack
+      WATCHTOWER_NOTIFICATION_SLACK_HOOK_URL: ${SLACK_WEBHOOK_URL:-}
+      WATCHTOWER_MONITOR_ONLY: ${WATCHTOWER_MONITOR_ONLY:-true}
+      TZ: ${TIMEZONE:-Asia/Kolkata}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    profiles:
+      - watchtower
